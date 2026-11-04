@@ -8,5 +8,7 @@ where py >nul 2>nul || set PY=python
   echo Instalando componentes de Python por unica vez...
   %PY% -m pip install --user pyodbc keyring openpyxl
 )
-%PY% blender_local.py
-pause
+if not exist "%USERPROFILE%\Desktop\Blender CNA.lnk" %PY% crear_acceso.py
+set PYW=pyw
+where pyw >nul 2>nul || set PYW=pythonw
+start "" %PYW% blender_local.py --ventana

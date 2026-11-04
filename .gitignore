@@ -3,3 +3,4 @@ local/maestros.json
 local/ajustes.json
 local/insumos_sap.json
 *.tmp
+local/blender.log
