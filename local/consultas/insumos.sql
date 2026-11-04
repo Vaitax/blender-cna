@@ -13,4 +13,5 @@ INNER JOIN "{schema}"."ITT1" T1 ON T1."Father" = T0."Code"
 INNER JOIN "{schema}"."OITM" P  ON P."ItemCode" = T0."Code"
 LEFT  JOIN "{schema}"."OITM" C  ON C."ItemCode" = T1."Code"
 WHERE T0."Code" LIKE 'MGM%'
+  AND COALESCE(P."frozenFor", 'N') <> 'Y'   -- sin artículos marcados como Inactivo en SAP
 ORDER BY T0."Code", T1."ChildNum"
