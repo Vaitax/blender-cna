@@ -47,8 +47,30 @@ def guardar_json(ruta, datos):
     os.replace(tmp, ruta)
 
 
+LOG = os.path.join(AQUI, "blender.log")
+
+
 def log(*a):
-    print(time.strftime("%H:%M:%S"), *a, flush=True)
+    linea = " ".join([time.strftime("%H:%M:%S")] + [str(x) for x in a])
+    try:
+        if sys.stdout:
+            print(linea, flush=True)
+    except Exception:  # noqa: BLE001  (con pythonw no hay consola)
+        pass
+    try:
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d ") + linea + "\n")
+    except OSError:
+        pass
+
+
+def aviso_windows(texto):
+    """Mensaje visible aunque no haya consola (modo ventana)."""
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(0, texto, "Blender CNA", 0x40)
+    except Exception:  # noqa: BLE001
+        log(texto)
 
 
 # ---------------------------------------------------------------- configuración
@@ -250,6 +272,7 @@ class Estado:
         self.sap = SAP(self.cfg)
         self.cache_excel = (None, 0, None)  # ruta, mtime, datos
         self.lock = threading.Lock()
+        self.ultimo_ping = 0
 
     def maestros(self, importar=False):
         """Precios y materias primas: de maestros.json; se crea (o reimporta) desde el Excel."""
@@ -348,6 +371,9 @@ def hacer_handler(estado):
                     return self.enviar(500, json.dumps({"error": str(e)}, ensure_ascii=False), "application/json")
             if u.path == "/api/ajustes":
                 return self.enviar(200, json.dumps(leer_json(AJUSTES, {}), ensure_ascii=False), "application/json")
+            if u.path == "/api/ping":
+                estado.ultimo_ping = time.time()
+                return self.enviar(200, "{}", "application/json")
             if u.path.endswith(".png"):
                 p = os.path.join(AQUI, "..", os.path.basename(u.path))
                 if os.path.exists(p):
@@ -379,13 +405,63 @@ def hacer_handler(estado):
     return H
 
 
+class Servidor(ThreadingHTTPServer):
+    # en Windows, reutilizar la dirección permitiría abrir dos Blender en el mismo puerto
+    allow_reuse_address = os.name != "nt"
+    daemon_threads = True
+
+
+def buscar_edge():
+    for base in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles"), os.environ.get("LOCALAPPDATA")):
+        if base:
+            p = os.path.join(base, "Microsoft", "Edge", "Application", "msedge.exe")
+            if os.path.exists(p):
+                return p
+    return None
+
+
+def abrir_ventana(url):
+    """Abre el Blender en una ventana propia (Edge en modo app: sin pestañas ni barra de direcciones)."""
+    edge = buscar_edge()
+    if not edge:
+        webbrowser.open(url)
+        return
+    perfil = os.path.join(os.environ.get("LOCALAPPDATA", AQUI), "BlenderCNA", "ventana")
+    import subprocess
+    subprocess.Popen([edge, f"--app={url}", f"--user-data-dir={perfil}", "--no-first-run",
+                      "--no-default-browser-check", "--window-size=1440,920"])
+
+
+def cerrar_si_no_hay_ventana(srv, estado):
+    """En modo ventana: cuando se cierra la ventana (la página deja de dar señales), se apaga la app."""
+    inicio = time.time()
+    while True:
+        time.sleep(10)
+        ref = estado.ultimo_ping or inicio
+        espera = 45 if estado.ultimo_ping else 180
+        if time.time() - ref > espera:
+            log("Ventana cerrada: se apaga el Blender")
+            srv.shutdown()
+            return
+
+
 def main():
+    ventana = "--ventana" in sys.argv
     estado = Estado()
     puerto = estado.cfg["puerto"]
-    srv = ThreadingHTTPServer(("127.0.0.1", puerto), hacer_handler(estado))  # solo este PC
     url = f"http://localhost:{puerto}/"
-    log("Blender CNA abierto en", url, "(cierra esta ventana para salir)")
-    if "--sin-navegador" not in sys.argv:
+    try:
+        srv = Servidor(("127.0.0.1", puerto), hacer_handler(estado))  # solo este PC
+    except OSError:
+        # ya hay un Blender abierto: solo se abre otra ventana
+        log("El Blender ya estaba abierto; se abre otra ventana")
+        abrir_ventana(url) if ventana else webbrowser.open(url)
+        return
+    log("Blender CNA abierto en", url, "" if ventana else "(cierra esta ventana para salir)")
+    if ventana:
+        threading.Timer(0.5, lambda: abrir_ventana(url)).start()
+        threading.Thread(target=cerrar_si_no_hay_ventana, args=(srv, estado), daemon=True).start()
+    elif "--sin-navegador" not in sys.argv:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:
         srv.serve_forever()
@@ -394,4 +470,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:  # noqa: BLE001
+        log("Error al iniciar:", repr(e))
+        if "--ventana" in sys.argv:
+            aviso_windows("No se pudo abrir el Blender: " + str(e) + "\n\nRevisa local\\blender.log")
+        raise

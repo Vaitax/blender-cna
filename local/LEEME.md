@@ -17,8 +17,12 @@ Administrador de credenciales de Windows.
 3. Si en tu PC **no** está guardada la clave de la app del bono, abre `local\Guardar clave SAP.bat`.
 
 ## Uso
-Abre `local\Abrir Blender.bat`. La primera vez instala lo que falta y después abre el Blender.
-Deja la ventana negra abierta mientras lo usas.
+La primera vez abre `local\Abrir Blender.bat`: instala lo que falta y crea en el escritorio el
+acceso directo **Blender CNA**. Desde entonces usa ese acceso directo.
+
+El Blender se abre en su propia ventana, sin pestañas ni barra de direcciones (usa Edge en modo
+aplicación) y sin ventana negra. Al cerrar la ventana, la app se apaga sola en menos de un minuto.
+Si algo falla, abre `local\Abrir Blender con consola.bat` para ver los mensajes, o revisa `local\blender.log`.
 
 - Arriba se indica de dónde vienen los datos y a qué hora se leyeron. **Sincronizar** los vuelve a leer.
 - SAP se lee al abrir, cada 30 minutos o al pulsar Sincronizar (como máximo una vez cada 2 minutos).
