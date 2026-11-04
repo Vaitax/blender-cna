@@ -271,6 +271,8 @@ table.mt input.ley.edited{border-color:#d9a400;background:#fff6c9;color:#3e3935;
 .live.err::before{background:var(--bad);box-shadow:0 0 0 3px var(--bad-soft)}
 .live.busy::before{background:var(--warn)}
 html.in-excel header{position:static}
+html.in-local header{position:sticky}
+html.in-local .brand{flex-wrap:nowrap}html.in-local .brand small{flex-basis:auto}
 html.in-excel .brand{flex-wrap:wrap}
 html.in-excel .brand small{display:inline-flex!important;flex-basis:100%;font-size:11.5px}
 </style>
@@ -698,9 +700,9 @@ function renderInsUpd(){
   $('#insNewWrap').hidden=!(u&&(u.added.length||u.changed.length));
   if(!u){if(OFFICE)el.innerHTML='Se lee directo de la hoja <b style="font-size:13px">Insumos por producto</b> de este libro.';return}
   const d=new Date(u.at);
-  if(OFFICE){el.innerHTML=`Se lee directo de la hoja <b style="font-size:13px">Insumos por producto</b> de este libro. Refresca la consulta de SAP en Excel (Datos › Actualizar todo) y el Blender toma los cambios solo.`+
+  if(OFFICE){el.innerHTML=(READ===readLocal&&SAPCMP?`Se lee directo de <b style="font-size:13px">SAP</b> (listas de materiales MGM). Comparado con la hoja del Excel: ${SAPCMP.n_solo_sap} solo en SAP, ${SAPCMP.n_solo_excel} solo en el Excel, ${SAPCMP.n_distintos} con receta distinta.`:`Se lee directo de la hoja <b style="font-size:13px">Insumos por producto</b> de este libro. Refresca la consulta de SAP en Excel (Datos › Actualizar todo) y el Blender toma los cambios solo.`)+
     ` Último cambio detectado: ${d.toLocaleDateString('es-CL')} ${d.toLocaleTimeString('es-CL',{hour:'2-digit',minute:'2-digit'})}`+
-    (u.added.length||u.changed.length?` · ${u.added.length} nuevos, ${u.changed.length} modificados`:'')+'.';return}
+    (u.added.length||u.changed.length?` · ${u.added.length} nuevos, ${u.changed.length} modificados`:'');return}
   el.innerHTML=`Última actualización: <b style="font-size:13px">${d.toLocaleDateString('es-CL')} ${d.toLocaleTimeString('es-CL',{hour:'2-digit',minute:'2-digit'})}</b> · ${esc(u.file)}`+
     (u.added.length||u.changed.length?` · ${u.added.length} nuevos, ${u.changed.length} modificados`:'')+'. Arrastra aquí el Excel refrescado para volver a actualizar.';
 }
@@ -908,20 +910,35 @@ async function readWorkbook(){
     const last=Math.max(2,u.rowIndex+u.rowCount);
     const rIp=ip.getRange('A1:F'+last);rIp.load('values');
     await ctx.sync();
-    return {lp:toSheet(rLp.values),bl:toSheet(rBl.values,rBl.formulas),ins:rIp.values};
+    return {name:bookName(),lp:toSheet(rLp.values),bl:toSheet(rBl.values,rBl.formulas),ins:rIp.values};
   });
 }
 function bookName(){try{const u=Office.context.document.url||'';const n=decodeURIComponent(u.split(/[\\/]/).pop().split('?')[0]);return n||'Libro abierto'}catch(e){return 'Libro abierto'}}
 function setStatus(cls,txt){const el=$('#srcName');el.className='live '+cls;el.textContent=txt}
-let syncing=false,again=false;
+let SAPCMP=null,syncing=false,again=false,READ=readWorkbook,lastAviso='';
 async function syncBook(first,manual){
   if(syncing){again=true;return}
-  syncing=true;setStatus('busy','Leyendo el libro…');
-  try{const w=await readWorkbook();const ch=applyWorkbook(bookName(),w.lp,w.bl,w.ins,first);
+  syncing=true;if(first||manual)setStatus('busy','Leyendo datos…');
+  try{const w=await READ(manual);if(w.comparacion)SAPCMP=w.comparacion;const ch=applyWorkbook(w.name,w.lp,w.bl,w.ins,first);
     const t=new Date().toLocaleTimeString('es-CL',{hour:'2-digit',minute:'2-digit'});
-    setStatus('',`Conectado a ${bookName()} · ${t}`);if(manual&&!ch)toast('El libro no tiene cambios desde la última lectura');
-  }catch(err){setStatus('err','Sin conexión con el libro');toast('No se pudo leer el libro: '+(err.message||err))}
+    const fuente=w.origen==='SAP'?`insumos de SAP · ${w.name}`:w.name;
+    setStatus(w.avisos&&w.avisos.length?'err':'',`Conectado a ${fuente} · ${t}`);
+    const av=(w.avisos||[]).join(' ');if(av&&(av!==lastAviso||manual))toast(av);lastAviso=av;
+    if(READ===readLocal)renderInsUpd();
+    if(manual&&!ch&&!av)toast('Sin cambios desde la última lectura');
+  }catch(err){setStatus('err','Sin conexión');toast('No se pudieron leer los datos: '+(err.message||err))}
   syncing=false;if(again){again=false;syncBook(false)}
+}
+// app local (blender_local.py): el servidor del PC lee SAP y el Excel de OneDrive
+async function readLocal(manual){
+  const r=await fetch('/api/datos'+(manual?'?forzar=1':''),{cache:'no-store'});const d=await r.json();
+  if(!r.ok||d.error)throw new Error(d.error||('error '+r.status));return d}
+function startLocal(){
+  OFFICE=true;READ=readLocal;document.documentElement.classList.add('in-excel','in-local');
+  $('#xlsBtn').hidden=true;$('#syncBtn').hidden=false;$('#insUp label.btn').hidden=true;
+  $('#syncBtn').title='Vuelve a leer SAP y el Excel del Blender';
+  $('#syncBtn').onclick=()=>syncBook(false,true);
+  syncBook(true);setInterval(()=>syncBook(false),60000);
 }
 function startOffice(){
   OFFICE=true;document.documentElement.classList.add('in-excel');
@@ -934,7 +951,8 @@ function startOffice(){
     await ctx.sync();
   }).catch(()=>{})}catch(e){}
 }
-if(window.Office&&Office.onReady)Office.onReady(info=>{if(info&&info.host===Office.HostType.Excel)startOffice()});
+if(/^(localhost|127\.0\.0\.1)$/.test(location.hostname)&&location.port)startLocal();
+else if(window.Office&&Office.onReady)Office.onReady(info=>{if(info&&info.host===Office.HostType.Excel)startOffice()});
 
 applyLeyes();build();
 if(!mix){mix={};loadExample()}

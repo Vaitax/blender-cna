@@ -1,0 +1,309 @@
+"""Blender CNA local.
+
+Abre el Blender en el navegador (http://localhost:8765) y le entrega los datos:
+- Insumos por producto: directo de SAP Business One (HANA) por ODBC, solo lectura.
+- LISTA PRECIOS y BLENDER (precios, materias primas y aportes): del Excel del Blender
+  en tu OneDrive sincronizado.
+Si SAP no responde, usa la hoja "Insumos por producto" del mismo Excel.
+
+Cuidado con la cuenta compartida de SAP: varios intentos fallidos la bloquean y botan
+los reportes de Power BI. Por eso esta app hace UN solo intento por vez, espera entre
+lecturas y, si la clave es rechazada, no vuelve a intentar hasta que la cierres.
+"""
+import configparser
+import glob
+import json
+import os
+import shutil
+import sys
+import tempfile
+import threading
+import time
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+AQUI = os.path.dirname(os.path.abspath(__file__))
+HOJAS = ("LISTA PRECIOS", "BLENDER", "INSUMOS POR PRODUCTO")
+MIN_ENTRE_INTENTOS_SAP = 120  # segundos
+
+
+def log(*a):
+    print(time.strftime("%H:%M:%S"), *a, flush=True)
+
+
+# ---------------------------------------------------------------- configuración
+def leer_config():
+    cp = configparser.ConfigParser(inline_comment_prefixes=(";",))
+    cp.read(os.path.join(AQUI, "config.ini"), encoding="utf-8")
+    g = lambda s, k, d: (cp.get(s, k, fallback=d) or d).strip()
+    return {
+        "excel": g("excel", "ruta", ""),
+        "sap_usar": g("sap", "usar", "si").lower() in ("si", "sí", "yes", "true", "1"),
+        "dsn": g("sap", "dsn", "hana"),
+        "usuario": g("sap", "usuario", "POWERBI"),
+        "base": g("sap", "base", "SBO_CNA_CHILE"),
+        "servicio": g("sap", "servicio_clave", "bono-hana"),
+        "refrescar": max(5, int(g("sap", "refrescar_cada_min", "30") or 30)) * 60,
+        "puerto": int(g("app", "puerto", "8765") or 8765),
+    }
+
+
+def buscar_excel(cfg):
+    if cfg["excel"]:
+        return cfg["excel"] if os.path.exists(cfg["excel"]) else None
+    casa = os.path.expanduser("~")
+    candidatos = []
+    for base in glob.glob(os.path.join(casa, "OneDrive*")) + [casa]:
+        for pat in ("**/BLENDER*.xlsx", "**/BLENDER*.xlsm"):
+            candidatos += [p for p in glob.glob(os.path.join(base, pat), recursive=True)
+                           if not os.path.basename(p).startswith("~$")]
+    return max(candidatos, key=os.path.getmtime) if candidatos else None
+
+
+# ---------------------------------------------------------------- Excel
+def col(i):
+    s = ""
+    i += 1
+    while i:
+        i, r = divmod(i - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def limpio(v):
+    if v is None or isinstance(v, (int, float, str, bool)):
+        return v
+    return str(v)
+
+
+def hoja_dict(ws_v, ws_f, filas=200, cols=28):
+    """Hoja como {A1: {v, f}} (el mismo formato que usa la app)."""
+    out = {}
+    for r, (fila_v, fila_f) in enumerate(zip(
+            ws_v.iter_rows(min_row=1, max_row=filas, max_col=cols, values_only=True),
+            ws_f.iter_rows(min_row=1, max_row=filas, max_col=cols, values_only=True))):
+        for c, (v, f) in enumerate(zip(fila_v, fila_f)):
+            formula = f[1:] if isinstance(f, str) and f.startswith("=") else None
+            if v is None and not formula:
+                continue
+            out[f"{col(c)}{r + 1}"] = {"v": limpio(v), "f": formula}
+    return out
+
+
+def leer_excel(ruta):
+    import openpyxl
+    # copia temporal: así no choca con Excel si el libro está abierto
+    tmp = os.path.join(tempfile.gettempdir(), "blender_cna_lectura.xlsx")
+    shutil.copy2(ruta, tmp)
+    wv = openpyxl.load_workbook(tmp, data_only=True, read_only=True)
+    wf = openpyxl.load_workbook(tmp, data_only=False, read_only=True)
+    nombre = {n.strip().upper(): n for n in wv.sheetnames}
+    falta = [h for h in HOJAS if h not in nombre]
+    if falta:
+        raise RuntimeError("al Excel le falta la hoja " + ", ".join(falta))
+    lp = hoja_dict(wv[nombre["LISTA PRECIOS"]], wf[nombre["LISTA PRECIOS"]], cols=2)
+    bl = hoja_dict(wv[nombre["BLENDER"]], wf[nombre["BLENDER"]])
+    ins = [[limpio(v) for v in fila]
+           for fila in wv[nombre["INSUMOS POR PRODUCTO"]].iter_rows(max_col=6, values_only=True)]
+    wv.close()
+    wf.close()
+    return lp, bl, ins
+
+
+# ---------------------------------------------------------------- SAP
+class SAP:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.bloqueado = None      # motivo por el que no se vuelve a intentar
+        self.ultimo_intento = 0
+        self.ultimo_ok = 0
+        self.filas = None
+        self.error = None
+        self.lock = threading.Lock()
+
+    def clave(self):
+        import keyring
+        return keyring.get_password(self.cfg["servicio"], self.cfg["usuario"])
+
+    def consultar(self):
+        import pyodbc
+        sql = open(os.path.join(AQUI, "consultas", "insumos.sql"), encoding="utf-8").read()
+        sql = sql.replace("{schema}", self.cfg["base"])
+        clave = self.clave()
+        if not clave:
+            raise PermissionError("FALTA_CLAVE")
+        cn = pyodbc.connect(f"DSN={self.cfg['dsn']};UID={self.cfg['usuario']};PWD={clave}",
+                            autocommit=True, timeout=20)
+        try:
+            cur = cn.cursor()
+            cur.execute(sql)
+            filas = [[limpio(v) for v in r] for r in cur.fetchall()]
+        finally:
+            cn.close()
+        cab = ["Codigos", "Name", "Código Insumo", "ItemName", "Dosificación", "Unidad Medida Insumo"]
+        return [cab] + filas
+
+    def obtener(self, forzar=False):
+        """Devuelve las filas de SAP en caché, o consulta si corresponde. Nunca reintenta en bucle."""
+        with self.lock:
+            if not self.cfg["sap_usar"] or self.bloqueado:
+                return self.filas
+            ahora = time.time()
+            vencido = ahora - self.ultimo_ok > self.cfg["refrescar"]
+            if not (forzar or vencido or self.filas is None):
+                return self.filas
+            if ahora - self.ultimo_intento < MIN_ENTRE_INTENTOS_SAP:
+                return self.filas
+            self.ultimo_intento = ahora
+            try:
+                log("Consultando SAP…")
+                self.filas = self.consultar()
+                self.ultimo_ok = time.time()
+                self.error = None
+                log(f"SAP OK: {len(self.filas) - 1} líneas de insumos")
+            except PermissionError:
+                self.bloqueado = ("No hay clave de SAP guardada para " + self.cfg["usuario"] +
+                                  ". Ejecuta 'Guardar clave SAP.bat' y vuelve a abrir el Blender.")
+                log(self.bloqueado)
+            except ImportError as e:
+                self.bloqueado = f"Falta instalar un componente de Python ({e.name}). Ejecuta 'Abrir Blender.bat' de nuevo."
+                log(self.bloqueado)
+            except Exception as e:  # noqa: BLE001
+                msg = str(e)
+                if any(t in msg.lower() for t in ("authentication failed", "28000", "invalid username or password",
+                                                  "user is locked", "password")):
+                    # clave rechazada: no volver a intentar para no bloquear la cuenta compartida
+                    self.bloqueado = ("SAP rechazó la clave de " + self.cfg["usuario"] +
+                                      ". No se volverá a intentar para no bloquear la cuenta. Revisa la clave con quien "
+                                      "administra la app del bono y vuelve a abrir el Blender.")
+                else:
+                    self.error = "No se pudo leer SAP: " + msg[:300]
+                log(self.bloqueado or self.error)
+            return self.filas
+
+
+# ---------------------------------------------------------------- comparación SAP vs Excel
+def firma_insumos(filas):
+    prods = {}
+    for r in filas[1:]:
+        if not r or not r[0] or not str(r[0]).strip().upper().startswith("MGM") or not r[2]:
+            continue
+        try:
+            q = round(float(str(r[4]).replace(",", ".")) if isinstance(r[4], str) else float(r[4] or 0), 4)
+        except ValueError:
+            q = 0
+        prods.setdefault(str(r[0]).strip(), []).append((str(r[2]).strip(), q))
+    return {k: sorted(v) for k, v in prods.items()}
+
+
+def comparar(sap, excel):
+    a, b = firma_insumos(sap), firma_insumos(excel)
+    solo_sap = sorted(set(a) - set(b))
+    solo_excel = sorted(set(b) - set(a))
+    distintos = sorted(k for k in set(a) & set(b) if a[k] != b[k])
+    return {"sap": len(a), "excel": len(b), "solo_sap": solo_sap[:50], "solo_excel": solo_excel[:50],
+            "distintos": distintos[:50], "n_solo_sap": len(solo_sap), "n_solo_excel": len(solo_excel),
+            "n_distintos": len(distintos)}
+
+
+# ---------------------------------------------------------------- servidor
+class Estado:
+    def __init__(self):
+        self.cfg = leer_config()
+        self.sap = SAP(self.cfg)
+        self.cache_excel = (None, 0, None)  # ruta, mtime, datos
+        self.lock = threading.Lock()
+
+    def excel(self):
+        ruta = buscar_excel(self.cfg)
+        if not ruta:
+            raise RuntimeError("no encontré el Excel del Blender. Escribe su ruta en config.ini (sección [excel]).")
+        mt = os.path.getmtime(ruta)
+        if self.cache_excel[0] != ruta or self.cache_excel[1] != mt:
+            log("Leyendo", ruta)
+            self.cache_excel = (ruta, mt, leer_excel(ruta))
+        return ruta, self.cache_excel[2]
+
+    def datos(self, forzar):
+        with self.lock:
+            return self._datos(forzar)
+
+    def _datos(self, forzar):
+        ruta, (lp, bl, ins_excel) = self.excel()
+        avisos = []
+        filas_sap = self.sap.obtener(forzar)
+        if filas_sap:
+            ins, origen = filas_sap, "SAP"
+        else:
+            ins, origen = ins_excel, "Excel"
+        if self.sap.bloqueado:
+            avisos.append(self.sap.bloqueado)
+        elif self.sap.error:
+            avisos.append(self.sap.error + (" Se usan los insumos del Excel." if origen == "Excel" else
+                                            " Se mantienen los últimos datos leídos de SAP."))
+        return {
+            "name": os.path.basename(ruta), "lp": lp, "bl": bl, "ins": ins, "origen": origen,
+            "sapAt": self.sap.ultimo_ok or None, "avisos": avisos,
+            "comparacion": comparar(filas_sap, ins_excel) if filas_sap else None,
+        }
+
+
+def buscar_html():
+    for p in (os.path.join(AQUI, "taskpane.html"), os.path.join(AQUI, "..", "taskpane.html")):
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError("taskpane.html")
+
+
+def hacer_handler(estado):
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def enviar(self, code, cuerpo, tipo):
+            b = cuerpo if isinstance(cuerpo, bytes) else cuerpo.encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", tipo)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(b)
+
+        def do_GET(self):
+            u = urlparse(self.path)
+            if u.path in ("/", "/index.html", "/taskpane.html"):
+                with open(buscar_html(), "rb") as f:
+                    return self.enviar(200, f.read(), "text/html; charset=utf-8")
+            if u.path == "/api/datos":
+                forzar = parse_qs(u.query).get("forzar", ["0"])[0] == "1"
+                try:
+                    d = estado.datos(forzar)
+                    return self.enviar(200, json.dumps(d, ensure_ascii=False, default=str), "application/json")
+                except Exception as e:  # noqa: BLE001
+                    log("Error:", e)
+                    return self.enviar(500, json.dumps({"error": str(e)}, ensure_ascii=False), "application/json")
+            if u.path.endswith(".png"):
+                p = os.path.join(AQUI, "..", os.path.basename(u.path))
+                if os.path.exists(p):
+                    with open(p, "rb") as f:
+                        return self.enviar(200, f.read(), "image/png")
+            self.enviar(404, "No encontrado", "text/plain; charset=utf-8")
+    return H
+
+
+def main():
+    estado = Estado()
+    puerto = estado.cfg["puerto"]
+    srv = ThreadingHTTPServer(("127.0.0.1", puerto), hacer_handler(estado))  # solo este PC
+    url = f"http://localhost:{puerto}/"
+    log("Blender CNA abierto en", url, "(cierra esta ventana para salir)")
+    if "--sin-navegador" not in sys.argv:
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
