@@ -11,6 +11,7 @@ los reportes de Power BI. Por eso esta app hace UN solo intento por vez, espera 
 lecturas y, si la clave es rechazada, no vuelve a intentar hasta que la cierres.
 """
 import configparser
+import decimal
 import glob
 import json
 import os
@@ -92,7 +93,19 @@ def col(i):
 def limpio(v):
     if v is None or isinstance(v, (int, float, str, bool)):
         return v
+    if isinstance(v, decimal.Decimal):  # HANA entrega las cantidades como Decimal
+        return float(v)
     return str(v)
+
+
+def num(v):
+    """Cantidad como número (también arregla lecturas guardadas con la cantidad como texto)."""
+    if isinstance(v, str):
+        try:
+            return float(v.strip().replace(",", ".")) if v.strip() else 0
+        except ValueError:
+            return v
+    return limpio(v)
 
 
 def hoja_dict(ws_v, ws_f, filas=200, cols=28):
@@ -137,7 +150,7 @@ class SAP:
         self.ultimo_intento = 0
         self.ultimo_ok = 0
         cache = leer_json(CACHE_SAP)
-        self.filas = cache["filas"] if cache else None
+        self.filas = ([cache["filas"][0]] + [r[:4] + [num(r[4])] + r[5:] for r in cache["filas"][1:]]) if cache else None
         self.ultimo_ok = cache["at"] if cache else 0
         self.de_cache = bool(cache)
         self.error = None
@@ -159,7 +172,7 @@ class SAP:
         try:
             cur = cn.cursor()
             cur.execute(sql)
-            filas = [[limpio(v) for v in r] for r in cur.fetchall()]
+            filas = [[limpio(v) for v in r[:4]] + [num(r[4]), limpio(r[5])] for r in cur.fetchall()]
         finally:
             cn.close()
         cab = ["Codigos", "Name", "Código Insumo", "ItemName", "Dosificación", "Unidad Medida Insumo"]
@@ -294,7 +307,7 @@ class Estado:
             ie = self.insumos_excel()
             cmp = comparar(filas_sap, ie) if ie else None
         return {
-            "name": "precios de este PC", "maestrosDe": m.get("origen"), "lp": m["lp"], "bl": m["bl"],
+            "name": "precios guardados en este PC", "maestrosDe": m.get("origen"), "lp": m["lp"], "bl": m["bl"],
             "ins": ins, "origen": origen, "sapAt": self.sap.ultimo_ok or None, "avisos": avisos,
             "comparacion": cmp,
         }
