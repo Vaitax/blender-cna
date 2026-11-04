@@ -385,8 +385,9 @@ html.in-excel .brand small{display:inline-flex!important;flex-basis:100%;font-si
     <div class="panel">
       <div class="panel-h">
         <h2>Lista de precios</h2>
-        <span class="muted">Precio lista en $ por tonelada. Los cambios se guardan sólo en este navegador.</span>
+        <span class="muted">Precio lista en $ por tonelada. <span class="savenote">Los cambios se guardan sólo en este navegador.</span></span>
         <div class="spacer"></div>
+        <button class="btn sm" id="importXls" hidden title="Vuelve a copiar precios, materias primas y aportes desde el Excel del Blender">Importar del Excel</button>
         <button class="btn sm" id="resetPrices">Restablecer precios del Excel</button>
       </div>
       <div class="scroll">
@@ -403,7 +404,7 @@ html.in-excel .brand small{display:inline-flex!important;flex-basis:100%;font-si
     <div class="card ley-card">
       <div class="card-h">
         <h2>Aportes por componente</h2>
-        <span class="muted">% que aporta cada componente al fertilizante. Al cambiar un valor se recalculan el Blender y las recetas. Los cambios se guardan sólo en este navegador.</span>
+        <span class="muted">% que aporta cada componente al fertilizante. Al cambiar un valor se recalculan el Blender y las recetas. <span class="savenote">Los cambios se guardan sólo en este navegador.</span></span>
         <div class="spacer"></div>
         <span class="muted" id="leyMeta"></span>
         <button class="btn sm" id="resetLeyes">Restablecer aportes del Excel</button>
@@ -423,7 +424,8 @@ html.in-excel .brand small{display:inline-flex!important;flex-basis:100%;font-si
 let OFFICE=false;
 const NUT=['N','P','K','MgO','S','CaO','B','Zn','Na'];
 
-const LS={get(k,d){try{const v=localStorage.getItem('cnb.'+k);return v==null?d:JSON.parse(v)}catch(e){return d}},set(k,v){try{localStorage.setItem('cnb.'+k,JSON.stringify(v))}catch(e){}},del(k){try{localStorage.removeItem('cnb.'+k)}catch(e){}}};
+const SAVEK=['prices','leyes','uso'];let SAVE_PC=null;
+const LS={get(k,d){try{const v=localStorage.getItem('cnb.'+k);return v==null?d:JSON.parse(v)}catch(e){return d}},set(k,v){try{localStorage.setItem('cnb.'+k,JSON.stringify(v))}catch(e){}if(SAVE_PC&&SAVEK.includes(k))SAVE_PC()},del(k){try{localStorage.removeItem('cnb.'+k)}catch(e){}if(SAVE_PC&&SAVEK.includes(k))SAVE_PC()}};
 const $=s=>document.querySelector(s);
 const fmt=(x,d=0)=>(x||0).toLocaleString('es-CL',{minimumFractionDigits:d,maximumFractionDigits:d});
 const f2=x=>Math.abs(x)<1e-9?'·':fmt(x,2);
@@ -809,7 +811,7 @@ document.addEventListener('keydown',e=>{
   const a=document.activeElement;if(a&&a.tagName==='INPUT'&&a.type!=='checkbox'&&a.value!==a.defaultValue)return;
   e.preventDefault();isUndo?undoRedo(undoStack,redoStack,'Deshecho'):undoRedo(redoStack,undoStack,'Rehecho');
 });
-$('#resetLeyes').onclick=()=>{remember('restablecer aportes');leyOv={};LS.del('leyes');applyLeyes();build();renderLeyes();renderBlender();toast('Aportes restablecidos a los del Excel')};
+$('#resetLeyes').onclick=()=>{remember('restablecer aportes');leyOv={};LS.del('leyes');applyLeyes();build();renderLeyes();renderBlender();toast(READ===readLocal?'Aportes restablecidos a los originales':'Aportes restablecidos a los del Excel')};
 // flechas, Enter y Tab confirman el precio y pasan a otra casilla
 let priceNext=null;
 $('#priceTable').addEventListener('mousedown',e=>{const t=e.target.closest('input.price');priceNext=t?t.id:null});
@@ -822,7 +824,7 @@ $('#priceTable').addEventListener('keydown',e=>{
   e.preventDefault();priceNext=nx?nx.id:null;el.blur();
   if(priceNext){nx.focus();nx.select();priceNext=null}
 });
-$('#resetPrices').onclick=()=>{remember('restablecer precios');priceOv={};LS.del('prices');build();renderPrecios();renderBlender();toast('Precios restablecidos a los del Excel')};
+$('#resetPrices').onclick=()=>{remember('restablecer precios');priceOv={};LS.del('prices');build();renderPrecios();renderBlender();toast(READ===readLocal?'Precios restablecidos a los originales':'Precios restablecidos a los del Excel')};
 $('#xlsIn').onchange=e=>{const f=e.target.files[0];if(f)importXlsx(f);e.target.value=''};
 $('#insIn').onchange=e=>{const f=e.target.files[0];if(f)importInsumos(f);e.target.value=''};
 $('#insNewOnly').onchange=e=>{state.insNew=e.target.checked;state.insLimit=300;renderInsumos()};
@@ -883,7 +885,7 @@ function applyWorkbook(src,lp,bl,insRows,first){
     const keep={};let lost=0;
     if(matsChanged){for(const i in mix){const m=D.mats[i];const j=m?mats.findIndex(x=>(m.c&&x.c===m.c)||(!m.c&&x.n===m.n)):-1;if(j>=0)keep[j]=mix[i];else lost++}
       mix=keep;LS.set('mix',mix);undoStack.length=redoStack.length=0}
-    const dropped=Object.keys(priceOv).filter(n=>(lista.find(x=>x.n===n)||{}).p&&(D.lista.find(x=>x.n===n)||{}).p!==(lista.find(x=>x.n===n)||{}).p);
+    const dropped=Object.keys(priceOv).filter(n=>{const o=D.lista.find(x=>x.n===n),nw=lista.find(x=>x.n===n);return o&&nw&&nw.p&&o.p!==nw.p});
     dropped.forEach(n=>delete priceOv[n]);LS.set('prices',priceOv);
     const insUpd=insChanged||!D.insUpd?{at:Date.now(),file:src,added:first&&D.source!==src?[]:added,changed:first&&D.source!==src?[]:changed,removed}:D.insUpd;
     D={source:src,lista,mats,ins,prods:[...prods].map(([k,v])=>[k,v[0],v[1]]),insUpd,pallet};
@@ -915,13 +917,15 @@ async function readWorkbook(){
 }
 function bookName(){try{const u=Office.context.document.url||'';const n=decodeURIComponent(u.split(/[\\/]/).pop().split('?')[0]);return n||'Libro abierto'}catch(e){return 'Libro abierto'}}
 function setStatus(cls,txt){const el=$('#srcName');el.className='live '+cls;el.textContent=txt}
+function confirmar(){const b=$('#importXls');if(b.dataset.ok){delete b.dataset.ok;b.textContent='Importar del Excel';return true}
+  b.dataset.ok='1';b.textContent='¿Seguro? Reemplaza la base; pulsa de nuevo';setTimeout(()=>{if(b.dataset.ok){delete b.dataset.ok;b.textContent='Importar del Excel'}},5000);return false}
 let SAPCMP=null,syncing=false,again=false,READ=readWorkbook,lastAviso='';
 async function syncBook(first,manual){
   if(syncing){again=true;return}
   syncing=true;if(first||manual)setStatus('busy','Leyendo datos…');
   try{const w=await READ(manual);if(w.comparacion)SAPCMP=w.comparacion;const ch=applyWorkbook(w.name,w.lp,w.bl,w.ins,first);
     const t=new Date().toLocaleTimeString('es-CL',{hour:'2-digit',minute:'2-digit'});
-    const fuente=w.origen==='SAP'?`insumos de SAP · ${w.name}`:w.name;
+    const fuente=READ===readLocal?(w.origen==='SAP'?'SAP · precios guardados en este PC':'precios guardados en este PC'):w.name;
     setStatus(w.avisos&&w.avisos.length?'err':'',`Conectado a ${fuente} · ${t}`);
     const av=(w.avisos||[]).join(' ');if(av&&(av!==lastAviso||manual))toast(av);lastAviso=av;
     if(READ===readLocal)renderInsUpd();
@@ -933,7 +937,21 @@ async function syncBook(first,manual){
 async function readLocal(manual){
   const r=await fetch('/api/datos'+(manual?'?forzar=1':''),{cache:'no-store'});const d=await r.json();
   if(!r.ok||d.error)throw new Error(d.error||('error '+r.status));return d}
-function startLocal(){
+async function startLocal(){
+  // precios, aportes y estados cambiados en la app se guardan en el PC (ajustes.json)
+  try{const a=await (await fetch('/api/ajustes',{cache:'no-store'})).json();
+    if(a&&(a.prices||a.leyes||a.uso)){priceOv=a.prices||{};leyOv=a.leyes||{};usoOv=a.uso||{};
+      ['prices','leyes','uso'].forEach(k=>{try{localStorage.setItem('cnb.'+k,JSON.stringify(a[k]||{}))}catch(e){}})}
+  }catch(e){}
+  let ts;SAVE_PC=()=>{clearTimeout(ts);ts=setTimeout(()=>fetch('/api/ajustes',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({prices:priceOv,leyes:leyOv,uso:usoOv})}).catch(()=>toast('No se pudieron guardar los cambios en el PC')),400)};
+  document.querySelectorAll('.savenote').forEach(e=>e.textContent='Los cambios se guardan en este PC.');
+  const th=[...document.querySelectorAll('#priceTable th')].find(t=>t.textContent==='Precio Excel');if(th)th.textContent='Precio original';
+  $('#resetPrices').textContent='Restablecer precios originales';$('#resetLeyes').textContent='Restablecer aportes originales';
+  $('#importXls').hidden=false;
+  $('#importXls').onclick=async()=>{if(!confirmar())return;
+    try{const r=await (await fetch('/api/importar-excel',{method:'POST'})).json();if(r.error)throw new Error(r.error);
+      toast('Precios y aportes copiados desde '+r.origen);syncBook(false)}catch(e){toast('No se pudo leer el Excel: '+(e.message||e))}};
   OFFICE=true;READ=readLocal;document.documentElement.classList.add('in-excel','in-local');
   $('#xlsBtn').hidden=true;$('#syncBtn').hidden=false;$('#insUp label.btn').hidden=true;
   $('#syncBtn').title='Vuelve a leer SAP y el Excel del Blender';

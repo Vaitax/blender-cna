@@ -2,9 +2,9 @@
 
 Abre el Blender en el navegador (http://localhost:8765) y le entrega los datos:
 - Insumos por producto: directo de SAP Business One (HANA) por ODBC, solo lectura.
-- LISTA PRECIOS y BLENDER (precios, materias primas y aportes): del Excel del Blender
-  en tu OneDrive sincronizado.
-Si SAP no responde, usa la hoja "Insumos por producto" del mismo Excel.
+- Precios, materias primas y aportes: guardados en este PC (maestros.json). Se toman una
+  vez del Excel del Blender y después se editan en la app; los cambios quedan en ajustes.json.
+Si SAP no responde, usa la última lectura guardada (insumos_sap.json) o la hoja del Excel.
 
 Cuidado con la cuenta compartida de SAP: varios intentos fallidos la bloquean y botan
 los reportes de Power BI. Por eso esta app hace UN solo intento por vez, espera entre
@@ -26,6 +26,24 @@ from urllib.parse import parse_qs, urlparse
 AQUI = os.path.dirname(os.path.abspath(__file__))
 HOJAS = ("LISTA PRECIOS", "BLENDER", "INSUMOS POR PRODUCTO")
 MIN_ENTRE_INTENTOS_SAP = 120  # segundos
+MAESTROS = os.path.join(AQUI, "maestros.json")      # LISTA PRECIOS y BLENDER (copia del Excel)
+AJUSTES = os.path.join(AQUI, "ajustes.json")        # precios, aportes y estados cambiados en la app
+CACHE_SAP = os.path.join(AQUI, "insumos_sap.json")  # última lectura buena de SAP
+
+
+def leer_json(ruta, defecto=None):
+    try:
+        with open(ruta, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return defecto
+
+
+def guardar_json(ruta, datos):
+    tmp = ruta + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(datos, f, ensure_ascii=False)
+    os.replace(tmp, ruta)
 
 
 def log(*a):
@@ -118,7 +136,10 @@ class SAP:
         self.bloqueado = None      # motivo por el que no se vuelve a intentar
         self.ultimo_intento = 0
         self.ultimo_ok = 0
-        self.filas = None
+        cache = leer_json(CACHE_SAP)
+        self.filas = cache["filas"] if cache else None
+        self.ultimo_ok = cache["at"] if cache else 0
+        self.de_cache = bool(cache)
         self.error = None
         self.lock = threading.Lock()
 
@@ -151,7 +172,7 @@ class SAP:
                 return self.filas
             ahora = time.time()
             vencido = ahora - self.ultimo_ok > self.cfg["refrescar"]
-            if not (forzar or vencido or self.filas is None):
+            if not (forzar or vencido or self.filas is None or self.de_cache):
                 return self.filas
             if ahora - self.ultimo_intento < MIN_ENTRE_INTENTOS_SAP:
                 return self.filas
@@ -160,7 +181,9 @@ class SAP:
                 log("Consultando SAP…")
                 self.filas = self.consultar()
                 self.ultimo_ok = time.time()
+                self.de_cache = False
                 self.error = None
+                guardar_json(CACHE_SAP, {"at": self.ultimo_ok, "filas": self.filas})
                 log(f"SAP OK: {len(self.filas) - 1} líneas de insumos")
             except PermissionError:
                 self.bloqueado = ("No hay clave de SAP guardada para " + self.cfg["usuario"] +
@@ -215,6 +238,23 @@ class Estado:
         self.cache_excel = (None, 0, None)  # ruta, mtime, datos
         self.lock = threading.Lock()
 
+    def maestros(self, importar=False):
+        """Precios y materias primas: de maestros.json; se crea (o reimporta) desde el Excel."""
+        m = None if importar else leer_json(MAESTROS)
+        if m:
+            return m
+        ruta, (lp, bl, _ins) = self.excel()
+        m = {"lp": lp, "bl": bl, "origen": os.path.basename(ruta), "at": time.time()}
+        guardar_json(MAESTROS, m)
+        log("Precios y aportes copiados desde", ruta)
+        return m
+
+    def insumos_excel(self):
+        try:
+            return self.excel()[1][2]
+        except Exception:  # noqa: BLE001  (el Excel es opcional)
+            return None
+
     def excel(self):
         ruta = buscar_excel(self.cfg)
         if not ruta:
@@ -230,22 +270,33 @@ class Estado:
             return self._datos(forzar)
 
     def _datos(self, forzar):
-        ruta, (lp, bl, ins_excel) = self.excel()
+        m = self.maestros()
         avisos = []
         filas_sap = self.sap.obtener(forzar)
+        ins_excel = None
         if filas_sap:
             ins, origen = filas_sap, "SAP"
         else:
-            ins, origen = ins_excel, "Excel"
+            ins_excel = self.insumos_excel()
+            ins, origen = ins_excel or [], "Excel"
+            if not ins_excel:
+                avisos.append("No hay insumos: SAP no respondió y no encontré el Excel del Blender.")
         if self.sap.bloqueado:
             avisos.append(self.sap.bloqueado)
         elif self.sap.error:
             avisos.append(self.sap.error + (" Se usan los insumos del Excel." if origen == "Excel" else
                                             " Se mantienen los últimos datos leídos de SAP."))
+        if filas_sap and self.sap.de_cache:
+            avisos.append("Insumos de la última lectura de SAP (" +
+                          time.strftime("%d-%m %H:%M", time.localtime(self.sap.ultimo_ok)) + ").")
+        cmp = None
+        if filas_sap:
+            ie = self.insumos_excel()
+            cmp = comparar(filas_sap, ie) if ie else None
         return {
-            "name": os.path.basename(ruta), "lp": lp, "bl": bl, "ins": ins, "origen": origen,
-            "sapAt": self.sap.ultimo_ok or None, "avisos": avisos,
-            "comparacion": comparar(filas_sap, ins_excel) if filas_sap else None,
+            "name": "precios de este PC", "maestrosDe": m.get("origen"), "lp": m["lp"], "bl": m["bl"],
+            "ins": ins, "origen": origen, "sapAt": self.sap.ultimo_ok or None, "avisos": avisos,
+            "comparacion": cmp,
         }
 
 
@@ -282,12 +333,36 @@ def hacer_handler(estado):
                 except Exception as e:  # noqa: BLE001
                     log("Error:", e)
                     return self.enviar(500, json.dumps({"error": str(e)}, ensure_ascii=False), "application/json")
+            if u.path == "/api/ajustes":
+                return self.enviar(200, json.dumps(leer_json(AJUSTES, {}), ensure_ascii=False), "application/json")
             if u.path.endswith(".png"):
                 p = os.path.join(AQUI, "..", os.path.basename(u.path))
                 if os.path.exists(p):
                     with open(p, "rb") as f:
                         return self.enviar(200, f.read(), "image/png")
             self.enviar(404, "No encontrado", "text/plain; charset=utf-8")
+        def do_POST(self):
+            u = urlparse(self.path)
+            # solo peticiones de la propia página (evita que otra web del navegador escriba aquí)
+            if self.headers.get("Origin") not in (None, f"http://localhost:{estado.cfg['puerto']}",
+                                                  f"http://127.0.0.1:{estado.cfg['puerto']}"):
+                return self.enviar(403, "{}", "application/json")
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                cuerpo = json.loads(self.rfile.read(n) or b"{}")
+                if u.path == "/api/ajustes":
+                    datos = {k: cuerpo.get(k, {}) for k in ("prices", "leyes", "uso")}
+                    guardar_json(AJUSTES, datos)
+                    return self.enviar(200, '{"ok":true}', "application/json")
+                if u.path == "/api/importar-excel":
+                    with estado.lock:
+                        m = estado.maestros(importar=True)
+                    return self.enviar(200, json.dumps({"ok": True, "origen": m["origen"]}, ensure_ascii=False),
+                                       "application/json")
+            except Exception as e:  # noqa: BLE001
+                log("Error:", e)
+                return self.enviar(500, json.dumps({"error": str(e)}, ensure_ascii=False), "application/json")
+            self.enviar(404, "{}", "application/json")
     return H
 
 
